@@ -738,6 +738,9 @@ struct whisper_model {
     std::vector<whisper_layer_encoder> layers_encoder;
     std::vector<whisper_layer_decoder> layers_decoder;
 
+    // list of devices used in this model
+    std::vector<ggml_backend_dev_t> devices;
+
     // ggml context that contains all the meta information about the model tensors
     struct ggml_context * ctx = nullptr;
 
@@ -1373,6 +1376,26 @@ static ggml_backend_buffer_type_t whisper_default_buffer_type(const whisper_cont
     return result;
 }
 
+static ggml_backend_buffer_type_t whisper_default_buffer_type_offload(const whisper_context_params & params, const whisper_model & model, int device) {
+    ggml_backend_buffer_type_t buft = nullptr;
+
+    if (device < (int)model.devices.size()) {
+        return ggml_backend_dev_buffer_type(model.devices[device]);
+    }
+    device -= (int)model.devices.size();
+
+#if defined(GGML_USE_KOMPUTE)
+    buft = ggml_backend_kompute_buffer_type(device);
+#endif
+
+    if (buft == nullptr) {
+        buft = whisper_default_buffer_type(params);
+    }
+    return buft;
+
+    GGML_UNUSED(model);
+}
+
 // load the model from a ggml file
 //
 // file format:
@@ -1797,8 +1820,9 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         }
     }
 
+    ggml_backend_buffer_type_t buft = whisper_default_buffer_type_offload(wctx.params, model, 0);// whisper_default_buffer_type(wctx.params);
     // allocate tensors in the backend buffers
-    model.buffer = ggml_backend_alloc_ctx_tensors_from_buft(model.ctx, whisper_default_buffer_type(wctx.params));
+    model.buffer = ggml_backend_alloc_ctx_tensors_from_buft(model.ctx, buft);
     if (!model.buffer) {
         WHISPER_LOG_ERROR("%s: failed to allocate memory for the model\n", __func__);
         return false;
@@ -3667,6 +3691,29 @@ struct whisper_context * whisper_init_with_params_no_state(struct whisper_model_
 
     whisper_context * ctx = new whisper_context;
     ctx->params = params;
+
+        // create list of devices to use with this model
+    // currently, we use all available devices
+    // TODO: rework API to give user more control over device selection
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        switch (ggml_backend_dev_type(dev)) {
+            case GGML_BACKEND_DEVICE_TYPE_CPU:
+            case GGML_BACKEND_DEVICE_TYPE_CPU_FULL:
+                // skip CPU backends since they are `handled separately
+                break;
+
+            case GGML_BACKEND_DEVICE_TYPE_GPU:
+            case GGML_BACKEND_DEVICE_TYPE_GPU_FULL:
+            {
+                size_t free, total; // NOLINT
+                ggml_backend_dev_memory(dev, &free, &total);
+                // LLAMA_LOG_INFO("%s: using device %s (%s) - %zu MiB free\n", __func__, ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), free/1024/1024);
+                ctx->model.devices.push_back(dev);
+                break;
+            }
+        }
+    }
 
     if (!whisper_model_load(loader, *ctx)) {
         loader->close(loader->context);
